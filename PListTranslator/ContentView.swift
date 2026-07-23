@@ -9,6 +9,11 @@ import SwiftUI
 import Translation
 import UniformTypeIdentifiers
 
+enum LocalizationFileType {
+    case plist
+    case strings
+}
+
 enum PlistPathComponent: Hashable {
     case key(String)
     case index(Int)
@@ -17,16 +22,25 @@ enum PlistPathComponent: Hashable {
 struct TranslationItem: Identifiable {
     let id = UUID()
     let key: String
-    let path: [PlistPathComponent]   // exact location in the plist tree
+    let path: [PlistPathComponent]?   // exact location in the plist tree
+    let comment: String?     // nil for plist entries that don't have one
     let original: String
     var translated: String?
 }
 
+enum ImportFormat: String, CaseIterable, Identifiable {
+    case plist = "Plist"
+    case strings = "Strings"
+    var id: String { rawValue }
+}
+
 
 struct ContentView: View {
+    
+    @State private var format: ImportFormat = .plist
 
     @State private var showImporter = false
-    @State private var plistURL: URL?
+    @State private var plistStringsURL: URL?
     @State private var locale = "th"
 
     @State private var items: [TranslationItem] = []
@@ -55,41 +69,66 @@ struct ContentView: View {
     ]
     
     var currentFileName: String {
-        plistURL?.lastPathComponent ?? "No file loaded"
+        plistStringsURL?.lastPathComponent ?? "No file loaded"
     }
 
     var body: some View {
         VStack {
             HStack {
-                Picker("Target language", selection: $locale) {
-                    ForEach(languages) { language in
-                        Text(language.name)
-                            .tag(language.id)
+                Picker("Import format", selection: $format) {
+                    ForEach(ImportFormat.allCases) { option in
+                        Text(option.rawValue).tag(option)
                     }
+                }
+                .pickerStyle(.radioGroup)
+                .onChange(of: format) { _, _ in
+                    plistStringsURL = nil
                 }
                 
                 Spacer()
                 
-                TextField("Keys to translate (comma-separated)", text: $targetKeysInput)
-                    .onChange(of: targetKeysInput) { _, newValue in
-                        targetKeys = Set(
-                            targetKeysInput
-                                .split(separator: ",")
-                                .map { $0.trimmingCharacters(in: .whitespaces) }
-                                .filter { !$0.isEmpty }
-                        )
+                Picker("Target language", selection: $locale) {
+                    ForEach(languages) { language in
+                        Text(language.name).tag(language.id)
                     }
-                
+                }
+            }
+            .padding()
+            
+            HStack {
+                if format == .plist {
+                    TextField("Keys to translate (comma-separated)", text: $targetKeysInput)
+                        .onChange(of: targetKeysInput) { _, newValue in
+                            targetKeys = Set(
+                                targetKeysInput
+                                    .split(separator: ",")
+                                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                                    .filter { !$0.isEmpty }
+                            )
+                        }
+                }
+                else {
+                    // .strings needs no extra field — key/value/comment are structural, not user-specified
+                    Spacer()
+                }
+            }.padding()
+            HStack {
                 Text(currentFileName)
                         .font(.headline)
                         .foregroundStyle(.secondary)
                 
                 Spacer()
                 
-                Button("Open plist") {
-                    showImporter = true
+                if format == .plist {
+                    Button("Open plist") {
+                        showImporter = true
+                    }
                 }
-                
+                else {
+                    Button("Open strings") {
+                        showImporter = true
+                    }
+                }
                 
             }
             .padding()
@@ -100,11 +139,19 @@ struct ContentView: View {
                 }
                 .disabled(items.isEmpty)
 
-                if plistURL != nil {
-                    Button("Save translated plist") {
-                        savePlist()
+                if plistStringsURL != nil {
+                    if format == .plist {
+                        Button("Save translated plist") {
+                            savePlist()
+                        }
+                        .disabled(items.isEmpty)
                     }
-                    .disabled(items.isEmpty)
+                    else if format == .strings {
+                        Button("Save translated Strings") {
+                            saveStrings()
+                        }
+                        .disabled(items.isEmpty)
+                    }
                 }
             }
             .padding()
@@ -132,20 +179,22 @@ struct ContentView: View {
 
         }
         .frame(minWidth: 600, minHeight: 500)
-
         .fileImporter(
             isPresented: $showImporter,
-            allowedContentTypes: [
-                UTType.propertyList
-            ]
+            allowedContentTypes: format == .plist ? [.propertyList] : [UTType(filenameExtension: "strings") ?? .plainText]
         ) { result in
             switch result {
                 case .success(let url):
-                    loadPlist(url)
+                    switch format {
+                        case .plist:
+                            loadPlist(url)
+                        case .strings:
+                            loadStrings(url)
+                    }
 
                 case .failure(let error):
                     print(error)
-            }
+                }
         }
 
         .translationPresentation(
@@ -227,7 +276,7 @@ struct ContentView: View {
 
     func loadPlist(_ url: URL) {
 
-        plistURL = url
+        plistStringsURL = url
         
         let accessGranted = url.startAccessingSecurityScopedResource()
 
@@ -253,7 +302,7 @@ struct ContentView: View {
         if let dictionary = object as? [String: Any] {
             for key in targetKeys {
                 if let title = dictionary[key] as? String {
-                    items.append(TranslationItem(key: key, path: path + [.key(key)], original: title))
+                    items.append(TranslationItem(key: key, path: path + [.key(key)], comment: nil, original: title))
                 }
             }
             for (key, value) in dictionary {
@@ -270,24 +319,24 @@ struct ContentView: View {
     // MARK: - Save plist
 
     func savePlist() {
-        if let plistURL {
-            if plistURL.startAccessingSecurityScopedResource() {
+        if let plistStringsURL {
+            if plistStringsURL.startAccessingSecurityScopedResource() {
                 defer {
-                    plistURL.stopAccessingSecurityScopedResource()
+                    plistStringsURL.stopAccessingSecurityScopedResource()
                 }
                 
                 do {
-                    let data = try Data(contentsOf: plistURL)
+                    let data = try Data(contentsOf: plistStringsURL)
                     var plist = try PropertyListSerialization.propertyList(from: data, options: [], format: nil)
                     replaceTitles(&plist)
                     //            let outputURL = plistURL.deletingPathExtension().appendingPathExtension("translated.plist")
                     let outputData = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
                     
-                    plistURL.stopAccessingSecurityScopedResource() // done reading, before showing panel
+                    plistStringsURL.stopAccessingSecurityScopedResource() // done reading, before showing panel
                     
                     let panel = NSSavePanel()
-                    panel.nameFieldStringValue = plistURL.deletingPathExtension().appendingPathExtension("translated.plist") .lastPathComponent
-                    panel.directoryURL = plistURL.deletingLastPathComponent()
+                    panel.nameFieldStringValue = plistStringsURL.deletingPathExtension().appendingPathExtension("translated.plist") .lastPathComponent
+                    panel.directoryURL = plistStringsURL.deletingLastPathComponent()
                     panel.allowedContentTypes = [.propertyList]
                     
                     if panel.runModal() == .OK, let outputURL = panel.url {
@@ -295,9 +344,6 @@ struct ContentView: View {
                         print("Saved:")
                         print(outputURL.path)
                     }
-                    //            try outputData.write(to: outputURL)
-                    //            print("Saved:")
-                    //            print(outputURL.path)
                 }
                 catch {
                     print(error)
@@ -342,15 +388,111 @@ struct ContentView: View {
     func replaceTitles(_ plist: inout Any) {
         for item in items {
             // translated (or original as fallback) at the existing key
-            setValue(item.translated ?? item.original, at: item.path, in: &plist)
-
-            // English reference at key_en, same location
-            guard let lastComponent = item.path.last, case .key(let originalKey) = lastComponent else { continue }
-            let referencePath = Array(item.path.dropLast()) + [.key(originalKey + "_en")]
-            setValue(item.original, at: referencePath, in: &plist)
+            if let path = item.path {
+                setValue(item.translated ?? item.original, at: path, in: &plist)
+                
+                // English reference at key_en, same location
+                guard let lastComponent = path.last, case .key(let originalKey) = lastComponent else { continue }
+                let referencePath = Array(path.dropLast()) + [.key(originalKey + "_en")]
+                setValue(item.original, at: referencePath, in: &plist)
+            }
         }
     }
     
+    // MARK: - Parse Strings
+    
+    struct StringsEntry {
+        let key: String
+        let value: String
+        let comment: String?
+    }
+    
+    func loadStrings(_ url: URL) {
+        let accessGranted = url.startAccessingSecurityScopedResource()
+        defer {
+            if accessGranted {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+        let entries = parseStringsFile(at: url.path)
+            
+        items = entries.map { entry in
+            TranslationItem(key: entry.key,path: nil, comment: entry.comment, original: entry.value)
+        }
+        plistStringsURL = url 
+    }
+
+    private func parseStringsFile(at path: String) -> [StringsEntry] {
+        
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
+
+        // Matches: optional /* comment */ then "key" = "value";
+        let pattern = #"(?:/\*\s*(.*?)\s*\*/\s*)?"([^"]+)"\s*=\s*"((?:[^"\\]|\\.)*)"\s*;"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else { return [] }
+
+        let nsRange = NSRange(content.startIndex..., in: content)
+        let matches = regex.matches(in: content, range: nsRange)
+
+        return matches.compactMap { match in
+            guard
+                let keyRange = Range(match.range(at: 2), in: content),
+                let valueRange = Range(match.range(at: 3), in: content)
+            else { return nil }
+
+            let key = String(content[keyRange])
+            let value = String(content[valueRange])
+            let comment: String? = {
+                guard match.range(at: 1).location != NSNotFound,
+                      let commentRange = Range(match.range(at: 1), in: content) else { return nil }
+                return String(content[commentRange])
+            }()
+
+            return StringsEntry(key: key, value: value, comment: comment)
+        }
+    }
+    
+    // MARK: - Save Strings
+    
+    func saveStrings() {
+        if let plistStringsURL {
+            if plistStringsURL.startAccessingSecurityScopedResource() {
+                defer {
+                    plistStringsURL.stopAccessingSecurityScopedResource()
+                }
+                
+                do {
+                    let panel = NSSavePanel()
+                    panel.nameFieldStringValue = plistStringsURL.deletingPathExtension().appendingPathExtension("translated.strings") .lastPathComponent
+                    panel.directoryURL = plistStringsURL.deletingLastPathComponent()
+                    panel.allowedContentTypes = [UTType(filenameExtension: "strings") ?? .plainText]
+                    
+                    if panel.runModal() == .OK, let outputURL = panel.url {
+                        try writeStringsFile(items: items, to: outputURL.path)
+                        print("Saved:")
+                        print(outputURL.path)
+                    }
+                }
+                catch {
+                    print(error)
+                }
+            }
+            else {
+                print("Cannot access file")
+            }
+        }
+    }
+    
+    func writeStringsFile(items: [TranslationItem], to path: String) throws {
+        var output = ""
+        for item in items {
+            if let comment = item.comment {
+                output += "/* \(comment) */\n"
+            }
+            let value = (item.translated ?? item.original).replacingOccurrences(of: "\"", with: "\\\"")
+            output += "\"\(item.key)\" = \"\(value)\";\n\n"
+        }
+        try output.write(toFile: path, atomically: true, encoding: .utf8)
+    }
 }
 
 #Preview {
